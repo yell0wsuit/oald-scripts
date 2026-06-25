@@ -146,6 +146,7 @@ def _normalize_headword(text: str) -> str:
         .replace("·", "")
         .replace("-", "")
         .replace(" ", "")
+        .replace("❄", "")
         .lower()
     )
 
@@ -212,6 +213,49 @@ class StyleInfo:
         if self.line_height > 5 and self.line_height != 0xFFFFFFFF:
             props.append(f"line-height: {self.line_height}pt")
         return "; ".join(props)
+
+
+@dataclass(frozen=True)
+class SearchWordList:
+    """Decoded accessors for one SlovoEd search word list."""
+
+    prefix: str
+    word_count: int
+    article_index_bits: int
+    word_offsets: tuple[int, ...]
+    word_data: bytes
+    index_data: bytes
+    tree: tuple
+
+    def word_at(self, index: int) -> str:
+        return _charchain_decode(
+            _BitInput(self.word_data, self.word_offsets[index]), self.tree
+        )
+
+    def article_index_at(self, index: int) -> int:
+        return _BitInput(self.index_data, index * self.article_index_bits).read(
+            self.article_index_bits
+        )
+
+    def find_word_indices(self, word: str) -> Iterator[int]:
+        needle = _normalize_headword(word)
+        lo = 0
+        hi = min(self.word_count, len(self.word_offsets))
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _normalize_headword(self.word_at(mid)) < needle:
+                lo = mid + 1
+            else:
+                hi = mid
+
+        index = lo
+        limit = min(self.word_count, len(self.word_offsets))
+        while index < limit:
+            current = _normalize_headword(self.word_at(index))
+            if current != needle:
+                break
+            yield index
+            index += 1
 
 
 class _BitInput:
@@ -297,6 +341,7 @@ class ArticleDecoder:
         self.styles = self._load_styles(style_tag)
         self._stream = self._build_stream(data_tag)
         self._qa = self._load_qa(qa_tag)
+        self._search_lists: dict[str, SearchWordList | None] = {}
 
     def _chunk(self, tag: str, index: int) -> bytes:
         size, offset, compressed = self._by_tag[tag][index]
@@ -314,6 +359,54 @@ class ArticleDecoder:
             chars = memoryview(t[16 + 4 * num_chars :]).cast("H")
             trees[index] = (code_size, num_chars, code_table, chars)
         return trees
+
+    def _load_search_word_list(self, prefix: str = "A") -> SearchWordList | None:
+        if prefix in self._search_lists:
+            return self._search_lists[prefix]
+
+        required = [
+            f"{prefix}INH",
+            f"{prefix}IND",
+            f"{prefix}DAT",
+            f"{prefix}SDT",
+            f"{prefix}TRE",
+        ]
+        if any(tag not in self._by_tag for tag in required):
+            self._search_lists[prefix] = None
+            return None
+
+        header = self._chunk(f"{prefix}INH", 0)
+        if len(header) < 28:
+            self._search_lists[prefix] = None
+            return None
+        fields = struct.unpack_from("<7I", header, 0)
+        word_count = fields[2]
+        article_index_bits = fields[6]
+        if article_index_bits <= 0:
+            self._search_lists[prefix] = None
+            return None
+
+        offset_data = self._build_stream(f"{prefix}SDT")
+        word_offsets = tuple(
+            struct.unpack_from("<I", offset_data, i * 4)[0]
+            for i in range(len(offset_data) // 4)
+        )
+        trees = self._load_trees(f"{prefix}TRE")
+        if 1 not in trees:
+            self._search_lists[prefix] = None
+            return None
+
+        word_list = SearchWordList(
+            prefix=prefix,
+            word_count=word_count,
+            article_index_bits=article_index_bits,
+            word_offsets=word_offsets,
+            word_data=self._build_stream(f"{prefix}DAT"),
+            index_data=self._build_stream(f"{prefix}IND"),
+            tree=trees[1],
+        )
+        self._search_lists[prefix] = word_list
+        return word_list
 
     def _build_stream(self, tag: str) -> bytes:
         stream = bytearray()
@@ -602,13 +695,43 @@ class ArticleDecoder:
             if limit is not None and emitted >= limit:
                 break
 
+    def _indexed_article_indices(self, word: str) -> Iterator[int]:
+        word_list = self._load_search_word_list("A")
+        if not word_list:
+            return
+        seen: set[int] = set()
+        for word_index in word_list.find_word_indices(word):
+            article_index = word_list.article_index_at(word_index)
+            if article_index in seen:
+                continue
+            seen.add(article_index)
+            yield article_index
+
     def find_entries(
         self, word: str, limit: int | None = None, include_html: bool = False
     ) -> "Iterator[dict]":
         """Find main dictionary entries whose normalized headword matches word."""
         needle = _normalize_headword(word)
         emitted = 0
+        seen: set[int] = set()
+        for article_index in self._indexed_article_indices(word):
+            entry = self.decode_entry(article_index)
+            if _normalize_headword(entry["headword"]) != needle:
+                continue
+            if not entry["definitions"]:
+                continue
+            if include_html:
+                entry = dict(entry)
+                entry["html"] = self.decode_html(article_index)
+            seen.add(article_index)
+            yield entry
+            emitted += 1
+            if limit is not None and emitted >= limit:
+                return
+
         for entry in self.iter_entries(include_html=include_html):
+            if entry["index"] in seen:
+                continue
             if _normalize_headword(entry["headword"]) != needle:
                 continue
             yield entry
