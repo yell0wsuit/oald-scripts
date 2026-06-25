@@ -18,23 +18,200 @@ source (CSldBitInput / CSldInputBase / sld2::decoders::CharChain):
      real HASH = header.HASH ^ DictID ^ NumberOfArticles (the compiler stores a
      masked HASH; see Compress.cpp / SldDefines.h).
 
-Output blocks are (style_index, text). Text blocks carry the visible content;
-other styles carry metadata (links, sound refs, CSS switches). Rendering them
-into clean HTML needs the style table (ARTS) and is out of scope here.
+Output blocks are (style_index, text). ARTS style records are decoded as well,
+so entries can be rendered as conservative style-annotated HTML or reduced to
+headword/definition JSON fields.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from html import escape
 import json
 import struct
 from pathlib import Path
+from typing import Iterator
 
 from decode_artd import decompress_chunk, iter_chunks
+
+META_NAMES = [
+    "eMetaText",
+    "eMetaPhonetics",
+    "eMetaImage",
+    "eMetaSound",
+    "eMetaTable",
+    "eMetaTableRow",
+    "eMetaTableCol",
+    "eMetaParagraph",
+    "eMetaLabel",
+    "eMetaLink",
+    "eMetaHide",
+    "eMetaHideControl",
+    "eMetaTest",
+    "eMetaTestInput",
+    "eMetaTestToken",
+    "eMetaPopupImage",
+    "eMetaUrl",
+    "eMetaUiElement",
+    "eMetaPopupArticle",
+    "eMetaNoBrText",
+    "eMetaInfoBlock",
+    "eMetaBackgroundImage",
+    "eMetaFlashCardsLink",
+    "eMetaVideo",
+    "eMetaScene",
+    "eMetaImageArea",
+    "eMetaSlideShow",
+    "eMetaVideoSource",
+    "eMetaMediaContainer",
+    "eMetaTestSpear",
+    "eMetaTestTarget",
+    "eMetaTestControl",
+    "eMetaSwitch",
+    "eMetaSwitchControl",
+    "eMetaSwitchState",
+    "eMetaManagedSwitch",
+    "eMetaDiv",
+    "eMetaMap",
+    "eMetaMapElement",
+    "eMetaCaption",
+    "eMetaTestResult",
+    "eMetaTestResultElement",
+    "eMetaTextControl",
+    "eMetaTaskBlockEntry",
+    "eMetaSidenote",
+    "eMetaConstructionSet",
+    "eMetaDrawingBlock",
+    "eMetaArticleEventHandler",
+    "eMetaDemoLink",
+    "eMeta_UnusedBroken",
+    "eMetaTestContainer",
+    "eMetaLegendItem",
+    "eMetaAtomicObject",
+    "eMetaCrossword",
+    "eMetaExternArticle",
+    "eMetaList",
+    "eMetaLi",
+    "eMetaInteractiveObject",
+    "eMeta_Unused0",
+    "eMetaTimeLine",
+    "eMetaTimeLineItem",
+    "eMetaAbstractResource",
+    "eMetaFormula",
+    "eMetaCrosswordHint",
+    "eMetaFootnoteBrief",
+    "eMetaFootnoteTotal",
+]
+
+FONT_FAMILIES = {
+    0: "sans-serif",
+    1: "serif",
+    2: "fantasy",
+    3: "monospace",
+}
 
 
 def _fourcc(value: int) -> str:
     return struct.pack("<I", value).decode("latin1")
+
+
+def _read_u16z(buf: bytes) -> str:
+    end = 0
+    while end + 1 < len(buf) and buf[end : end + 2] != b"\0\0":
+        end += 2
+    return buf[:end].decode("utf-16le", "replace")
+
+
+def _fixup_block_text(text: str) -> str:
+    if text[-4:].lower() == r"\%0a":
+        return text[:-4] + "\n"
+    return text
+
+
+def _html_attr(text: str) -> str:
+    safe = "".join(
+        ch if ord(ch) >= 32 or ch in "\t\n\r" else f"\\x{ord(ch):02x}" for ch in text
+    )
+    return escape(safe, quote=True)
+
+
+def _clean_entry_text(text: str) -> str:
+    return " ".join(text.replace("\u200b", "").split())
+
+
+def _normalize_headword(text: str) -> str:
+    return (
+        _clean_entry_text(text)
+        .replace("·", "")
+        .replace("-", "")
+        .replace(" ", "")
+        .lower()
+    )
+
+
+@dataclass(frozen=True)
+class StyleInfo:
+    """Decoded ARTS style record, using the default variant."""
+
+    index: int
+    tag: str
+    usages: tuple[int, ...]
+    variant_type: int
+    visible: bool
+    meta_type: int
+    level: int
+    color: tuple[int, int, int, int]
+    background: tuple[int, int, int, int]
+    bold: int
+    italic: bool
+    underline: int
+    strikethrough: bool
+    text_size: int
+    line_height: int
+    font_family: int
+    font_name: int
+    prefix: str
+    postfix: str
+    overline: bool
+    unclickable: bool
+
+    @property
+    def meta_name(self) -> str:
+        if 0 <= self.meta_type < len(META_NAMES):
+            return META_NAMES[self.meta_type]
+        if self.meta_type == 0xFFFF:
+            return "eMetaUnknown"
+        return f"eMeta_{self.meta_type}"
+
+    def css(self) -> str:
+        props: list[str] = []
+        r, g, b, a = self.color
+        if a and (r, g, b) != (0, 0, 0):
+            props.append(f"color: #{r:02x}{g:02x}{b:02x}")
+        br, bg, bb, ba = self.background
+        if ba and (br, bg, bb) != (0, 0, 0):
+            props.append(f"background-color: #{br:02x}{bg:02x}{bb:02x}")
+        if self.bold:
+            props.append("font-weight: bold")
+        if self.italic:
+            props.append("font-style: italic")
+        decoration = []
+        if self.underline:
+            decoration.append("underline")
+        if self.strikethrough:
+            decoration.append("line-through")
+        if self.overline:
+            decoration.append("overline")
+        if decoration:
+            props.append(f"text-decoration: {' '.join(decoration)}")
+        if self.font_family in FONT_FAMILIES:
+            props.append(f"font-family: {FONT_FAMILIES[self.font_family]}")
+        if self.text_size > 5 and self.text_size != 0xFFFFFFFF:
+            props.append(f"font-size: {self.text_size}pt")
+        if self.line_height > 5 and self.line_height != 0xFFFFFFFF:
+            props.append(f"line-height: {self.line_height}pt")
+        return "; ".join(props)
 
 
 class _BitInput:
@@ -109,6 +286,7 @@ class ArticleDecoder:
         data_tag = _fourcc(fields[8])
         qa_tag = _fourcc(fields[9])
         tree_tag = _fourcc(fields[10])
+        style_tag = _fourcc(fields[11])
         self.num_articles = fields[12]
         if fields[13] != 2:
             raise ValueError(
@@ -116,6 +294,7 @@ class ArticleDecoder:
             )
 
         self._trees = self._load_trees(tree_tag)
+        self.styles = self._load_styles(style_tag)
         self._stream = self._build_stream(data_tag)
         self._qa = self._load_qa(qa_tag)
 
@@ -151,6 +330,103 @@ class ArticleDecoder:
             entries.append((index, _qa_restore(shift, self.hash)))
         return entries
 
+    def _load_styles(self, tag: str) -> list[StyleInfo]:
+        data = bytearray()
+        for index in sorted(self._by_tag.get(tag, {})):
+            data += self._chunk(tag, index)
+
+        styles: list[StyleInfo] = []
+        off = 0
+        index = 0
+        while off < len(data):
+            struct_size, total_size, _language, variants_count = struct.unpack_from(
+                "<4I", data, off
+            )
+            if struct_size == 0 or total_size == 0:
+                break
+            if struct_size < 128 or off + total_size > len(data):
+                raise ValueError(
+                    f"bad ARTS style {index}: struct=0x{struct_size:x} total=0x{total_size:x}"
+                )
+            (
+                _struct_size,
+                _total_size,
+                _language,
+                _variants_count,
+                variant_size,
+                default_variant,
+                usage_count,
+                usage_size,
+            ) = struct.unpack_from("<8I", data, off)
+            tag_name = _read_u16z(data[off + 32 : off + 96])
+
+            cursor = off + struct_size
+            usages = tuple(
+                struct.unpack_from("<I", data, cursor + i * usage_size)[0]
+                for i in range(usage_count)
+            )
+            cursor += usage_count * usage_size
+
+            if variants_count == 0:
+                styles.append(
+                    StyleInfo(
+                        index=index,
+                        tag=tag_name,
+                        usages=usages,
+                        variant_type=0,
+                        visible=False,
+                        meta_type=0xFFFF,
+                        level=0,
+                        color=(0, 0, 0, 0),
+                        background=(0, 0, 0, 0),
+                        bold=0,
+                        italic=False,
+                        underline=0,
+                        strikethrough=False,
+                        text_size=0,
+                        line_height=0,
+                        font_family=0xFFFF,
+                        font_name=0xFFFF,
+                        prefix="",
+                        postfix="",
+                        overline=False,
+                        unclickable=False,
+                    )
+                )
+            else:
+                variant_index = min(default_variant, variants_count - 1)
+                v = cursor + variant_index * variant_size
+                fields = struct.unpack_from("<22I", data, v)
+                styles.append(
+                    StyleInfo(
+                        index=index,
+                        tag=tag_name,
+                        usages=usages,
+                        variant_type=fields[1],
+                        visible=bool(fields[2]),
+                        meta_type=fields[3],
+                        level=fields[4],
+                        color=(fields[5], fields[6], fields[7], fields[8]),
+                        background=(fields[9], fields[10], fields[11], fields[12]),
+                        bold=fields[13],
+                        italic=bool(fields[14]),
+                        underline=fields[15],
+                        strikethrough=bool(fields[16]),
+                        text_size=fields[17],
+                        line_height=fields[18],
+                        font_family=fields[19],
+                        font_name=fields[20],
+                        prefix=_read_u16z(data[v + 84 : v + 118]),
+                        postfix=_read_u16z(data[v + 118 : v + 152]),
+                        overline=bool(struct.unpack_from("<I", data, v + 152)[0]),
+                        unclickable=bool(struct.unpack_from("<I", data, v + 164)[0]),
+                    )
+                )
+
+            off += total_size
+            index += 1
+        return styles
+
     def _read_article(self, bits: _BitInput) -> list[tuple[int, str]]:
         styles = _charchain_decode(bits, self._trees[0])
         blocks = []
@@ -181,6 +457,165 @@ class ArticleDecoder:
             blocks = self._read_article(bits)
         return blocks
 
+    def _html_from_blocks(
+        self, article_index: int, blocks: list[tuple[int, str]]
+    ) -> str:
+        parts = [f'<article data-index="{article_index}">']
+        for style_index, raw_text in blocks:
+            style = self.styles[style_index] if style_index < len(self.styles) else None
+            text = raw_text
+            if style and style.meta_type in (0, 1):
+                text = style.prefix + _fixup_block_text(text) + style.postfix
+            if not text:
+                continue
+
+            if style and style.meta_type not in (0, 1):
+                parts.append(
+                    "<span hidden"
+                    f' data-style="{style_index}"'
+                    f' data-meta="{escape(style.meta_name)}"'
+                    f' data-raw="{_html_attr(text)}"></span>'
+                )
+                continue
+
+            meta = escape(style.meta_name if style else "eMetaUnknown")
+            cls = f"sld-style s{style_index}"
+            if style and style.meta_type == 1:
+                cls += " phonetics"
+            css = style.css() if style else ""
+            attrs = [
+                f'class="{cls}"',
+                f'data-style="{style_index}"',
+                f'data-meta="{meta}"',
+            ]
+            if style and style.tag:
+                attrs.append(f'data-tag="{_html_attr(style.tag)}"')
+            if css:
+                attrs.append(f'style="{_html_attr(css)}"')
+            parts.append(f"<span {' '.join(attrs)}>{escape(text)}</span>")
+        parts.append("</article>")
+        return "\n".join(parts)
+
+    def decode_html(self, article_index: int) -> str:
+        """Decode one article into conservative, style-annotated HTML."""
+        return self._html_from_blocks(article_index, self.decode(article_index))
+
+    def _entry_from_blocks(
+        self, article_index: int, blocks: list[tuple[int, str]]
+    ) -> dict:
+        headword_parts: list[str] = []
+        part_of_speech: list[str] = []
+        phonetics: list[str] = []
+        definitions: list[str] = []
+        word_origin: list[str] = []
+
+        in_word_origin = False
+        for style_index, raw_text in blocks:
+            if style_index >= len(self.styles):
+                continue
+            style = self.styles[style_index]
+            if style.meta_type not in (0, 1):
+                continue
+            text = _fixup_block_text(raw_text)
+            tag = style.tag
+            if not text:
+                continue
+            if tag in {"h", "h_dot", "h_sup", "hm-g"}:
+                headword_parts.append(text)
+            elif tag in {"pos", "pos-g"}:
+                cleaned = _clean_entry_text(text)
+                if cleaned:
+                    part_of_speech.append(cleaned)
+            elif tag == "phon":
+                cleaned = _clean_entry_text(text)
+                if cleaned:
+                    phonetics.append(cleaned)
+            elif tag == "def":
+                cleaned = _clean_entry_text(text)
+                if cleaned:
+                    definitions.append(cleaned)
+            elif "Word Origin" in text:
+                in_word_origin = True
+            elif in_word_origin and tag in {
+                "body",
+                "ff",
+                "lang",
+                "etym_i",
+                "qt",
+                "pnc",
+            }:
+                cleaned = _clean_entry_text(text)
+                if cleaned:
+                    word_origin.append(cleaned)
+
+        return {
+            "index": article_index,
+            "headword": _clean_entry_text("".join(headword_parts)),
+            "part_of_speech": " ".join(dict.fromkeys(part_of_speech)),
+            "phonetics": list(dict.fromkeys(phonetics)),
+            "definitions": definitions,
+            "word_origin": _clean_entry_text(" ".join(word_origin)),
+        }
+
+    def decode_entry(self, article_index: int) -> dict:
+        """Decode one main dictionary article into headword/definition fields."""
+        return self._entry_from_blocks(article_index, self.decode(article_index))
+
+    def iter_articles(
+        self, start: int = 0, limit: int | None = None
+    ) -> "Iterator[tuple[int, list[tuple[int, str]]]]":
+        """Yield decoded articles sequentially from the ARTD stream."""
+        if start < 0 or start >= self.num_articles:
+            raise IndexError(start)
+        start_index, start_pos = 0, self._qa[0][1]
+        for index, pos in self._qa:
+            if index <= start:
+                start_index, start_pos = index, pos
+            else:
+                break
+
+        bits = _BitInput(self._stream, start_pos)
+        emitted = 0
+        for article_index in range(start_index, self.num_articles):
+            blocks = self._read_article(bits)
+            if article_index < start:
+                continue
+            yield article_index, blocks
+            emitted += 1
+            if limit is not None and emitted >= limit:
+                break
+
+    def iter_entries(
+        self, start: int = 0, limit: int | None = None, include_html: bool = False
+    ) -> "Iterator[dict]":
+        """Yield main dictionary entries with definitions."""
+        emitted = 0
+        for article_index, blocks in self.iter_articles(start):
+            entry = self._entry_from_blocks(article_index, blocks)
+            if not entry["headword"] or not entry["definitions"]:
+                continue
+            if include_html:
+                entry = dict(entry)
+                entry["html"] = self._html_from_blocks(article_index, blocks)
+            yield entry
+            emitted += 1
+            if limit is not None and emitted >= limit:
+                break
+
+    def find_entries(
+        self, word: str, limit: int | None = None, include_html: bool = False
+    ) -> "Iterator[dict]":
+        """Find main dictionary entries whose normalized headword matches word."""
+        needle = _normalize_headword(word)
+        emitted = 0
+        for entry in self.iter_entries(include_html=include_html):
+            if _normalize_headword(entry["headword"]) != needle:
+                continue
+            yield entry
+            emitted += 1
+            if limit is not None and emitted >= limit:
+                break
+
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point: decode article(s) to JSON blocks."""
@@ -188,24 +623,134 @@ def main(argv: list[str] | None = None) -> int:
         description="Decode SlovoEd ARTD articles from an SDC file."
     )
     parser.add_argument("sdc", type=Path, help="Path to the .sdc file")
-    parser.add_argument("index", type=int, help="Article index to decode")
+    parser.add_argument("index", type=int, nargs="?", help="Article index to decode")
     parser.add_argument(
         "-n", "--count", type=int, default=1, help="Number of consecutive articles"
     )
     parser.add_argument(
         "-o", "--out", type=Path, help="Write JSON here instead of stdout"
     )
+    parser.add_argument(
+        "--json-out", type=Path, help="Write JSON output here instead of stdout"
+    )
+    parser.add_argument("--html-out", type=Path, help="Write rendered HTML output here")
+    parser.add_argument(
+        "--with-html",
+        action="store_true",
+        help="Include rendered HTML in JSON entry output",
+    )
+    parser.add_argument(
+        "--html", action="store_true", help="Render best-effort HTML instead of JSON"
+    )
+    parser.add_argument(
+        "--entry",
+        action="store_true",
+        help="Render dictionary entry fields instead of raw blocks",
+    )
+    parser.add_argument("--word", help="Find dictionary entries by headword")
+    parser.add_argument(
+        "--dump-entries",
+        action="store_true",
+        help="Stream all main dictionary entries as JSON Lines",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Limit --word matches or --dump-entries output",
+    )
     args = parser.parse_args(argv)
 
     dec = ArticleDecoder(args.sdc)
-    result = {
-        i: [{"style": s, "text": t} for s, t in dec.decode(i)]
-        for i in range(args.index, args.index + args.count)
-    }
-    text = json.dumps(result, ensure_ascii=False, indent=2)
-    if args.out:
-        args.out.write_text(text, "utf-8")
-        print(f"wrote {len(result)} article(s) -> {args.out}")
+    json_out = args.json_out or args.out
+
+    if args.word:
+        include_html = args.with_html or bool(args.html_out)
+        matches = list(
+            dec.find_entries(args.word, args.limit, include_html=include_html)
+        )
+        text = json.dumps(matches, ensure_ascii=False, indent=2)
+        if args.html_out:
+            args.html_out.write_text(
+                "\n".join(match["html"] for match in matches), "utf-8"
+            )
+            print(f"wrote HTML -> {args.html_out}")
+            if not args.with_html:
+                matches = [
+                    {k: v for k, v in match.items() if k != "html"} for match in matches
+                ]
+                text = json.dumps(matches, ensure_ascii=False, indent=2)
+    elif args.dump_entries:
+        include_html = args.with_html or bool(args.html_out)
+        entries = dec.iter_entries(limit=args.limit, include_html=include_html)
+        if json_out:
+            html_file = (
+                args.html_out.open("w", encoding="utf-8") if args.html_out else None
+            )
+            with json_out.open("w", encoding="utf-8") as f:
+                count = 0
+                try:
+                    for entry in entries:
+                        if html_file:
+                            html_file.write(entry["html"] + "\n")
+                        json_entry = (
+                            entry
+                            if args.with_html
+                            else {k: v for k, v in entry.items() if k != "html"}
+                        )
+                        f.write(json.dumps(json_entry, ensure_ascii=False) + "\n")
+                        count += 1
+                finally:
+                    if html_file:
+                        html_file.close()
+            print(f"wrote {count} entries -> {json_out}")
+            if args.html_out:
+                print(f"wrote HTML -> {args.html_out}")
+            return 0
+        rows = []
+        html_parts = []
+        for entry in entries:
+            if args.html_out:
+                html_parts.append(entry["html"])
+            json_entry = (
+                entry
+                if args.with_html
+                else {k: v for k, v in entry.items() if k != "html"}
+            )
+            rows.append(json.dumps(json_entry, ensure_ascii=False))
+        if args.html_out:
+            args.html_out.write_text("\n".join(html_parts), "utf-8")
+            print(f"wrote HTML -> {args.html_out}")
+        text = "\n".join(rows)
+    else:
+        if args.index is None:
+            parser.error("index is required unless --word or --dump-entries is used")
+        if args.entry:
+            result = {
+                i: dec.decode_entry(i)
+                for i in range(args.index, args.index + args.count)
+            }
+            if args.with_html:
+                for i, entry in result.items():
+                    entry["html"] = dec.decode_html(i)
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+        elif args.html:
+            articles = [
+                dec.decode_html(i) for i in range(args.index, args.index + args.count)
+            ]
+            text = "\n".join(articles)
+            if args.html_out:
+                args.html_out.write_text(text, "utf-8")
+                print(f"wrote HTML -> {args.html_out}")
+        else:
+            result = {
+                i: [{"style": s, "text": t} for s, t in dec.decode(i)]
+                for i in range(args.index, args.index + args.count)
+            }
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+    if json_out:
+        json_out.write_text(text, "utf-8")
+        print(f"wrote JSON -> {json_out}")
     else:
         print(text)
     return 0
