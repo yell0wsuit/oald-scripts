@@ -342,11 +342,28 @@ class ArticleDecoder:
         self._stream = self._build_stream(data_tag)
         self._qa = self._load_qa(qa_tag)
         self._search_lists: dict[str, SearchWordList | None] = {}
+        self._search_list_prefixes = self._discover_search_list_prefixes()
 
     def _chunk(self, tag: str, index: int) -> bytes:
         size, offset, compressed = self._by_tag[tag][index]
         payload = self._buf[offset : offset + size]
         return decompress_chunk(payload) if compressed else payload
+
+    def _discover_search_list_prefixes(self) -> tuple[str, ...]:
+        prefixes = {
+            tag[0]
+            for tag in self._by_tag
+            if len(tag) == 4 and tag.endswith("INH") and tag[0].isalpha()
+        }
+        compatible = [
+            prefix
+            for prefix in prefixes
+            if all(
+                f"{prefix}{suffix}" in self._by_tag
+                for suffix in ("INH", "IND", "DAT", "SDT", "TRE")
+            )
+        ]
+        return tuple(sorted(compatible, key=lambda prefix: (prefix != "A", prefix)))
 
     def _load_trees(self, tag: str) -> dict[int, tuple]:
         trees = {}
@@ -696,16 +713,17 @@ class ArticleDecoder:
                 break
 
     def _indexed_article_indices(self, word: str) -> Iterator[int]:
-        word_list = self._load_search_word_list("A")
-        if not word_list:
-            return
         seen: set[int] = set()
-        for word_index in word_list.find_word_indices(word):
-            article_index = word_list.article_index_at(word_index)
-            if article_index in seen:
+        for prefix in self._search_list_prefixes:
+            word_list = self._load_search_word_list(prefix)
+            if not word_list:
                 continue
-            seen.add(article_index)
-            yield article_index
+            for word_index in word_list.find_word_indices(word):
+                article_index = word_list.article_index_at(word_index)
+                if article_index in seen or not 0 <= article_index < self.num_articles:
+                    continue
+                seen.add(article_index)
+                yield article_index
 
     def find_entries(
         self, word: str, limit: int | None = None, include_html: bool = False
