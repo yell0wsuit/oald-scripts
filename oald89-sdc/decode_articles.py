@@ -29,6 +29,7 @@ import argparse
 from dataclasses import dataclass
 from html import escape
 import json
+import re
 import struct
 from pathlib import Path
 from typing import Iterator
@@ -111,6 +112,23 @@ FONT_FAMILIES = {
     3: "monospace",
 }
 
+SECTION_SKIP_TAGS = {
+    "br",
+    "gr_tri",
+    "or_tri",
+    "whitespace",
+    "whitespace_big",
+    "whitespace_char",
+    "whitespace_small",
+    "whitespace_unm",
+}
+
+SECTION_HEADING_TEXT = {
+    "Extra examples",
+    "Idioms",
+    "Phrasal verbs",
+}
+
 
 def _fourcc(value: int) -> str:
     return struct.pack("<I", value).decode("latin1")
@@ -137,7 +155,9 @@ def _html_attr(text: str) -> str:
 
 
 def _clean_entry_text(text: str) -> str:
-    return " ".join(text.replace("\u200b", "").split())
+    cleaned = " ".join(text.replace("\u200b", "").split())
+    cleaned = re.sub(r"\s+([,.;:!?ʼ)])", r"\1", cleaned)
+    return re.sub(r"([‘(])\s+", r"\1", cleaned)
 
 
 def _normalize_headword(text: str) -> str:
@@ -149,6 +169,26 @@ def _normalize_headword(text: str) -> str:
         .replace("❄", "")
         .lower()
     )
+
+
+def _visible_blocks(
+    blocks: list[tuple[int, str]], styles: list["StyleInfo"]
+) -> list[dict]:
+    visible = []
+    for style_index, raw_text in blocks:
+        style = styles[style_index] if style_index < len(styles) else None
+        text = _fixup_block_text(raw_text)
+        if not text or (style and style.meta_type not in (0, 1)):
+            continue
+        visible.append(
+            {
+                "style": style_index,
+                "tag": style.tag if style else "",
+                "meta": style.meta_name if style else "eMetaUnknown",
+                "text": text,
+            }
+        )
+    return visible
 
 
 @dataclass(frozen=True)
@@ -611,13 +651,25 @@ class ArticleDecoder:
         return self._html_from_blocks(article_index, self.decode(article_index))
 
     def _entry_from_blocks(
-        self, article_index: int, blocks: list[tuple[int, str]]
+        self,
+        article_index: int,
+        blocks: list[tuple[int, str]],
+        include_blocks: bool = False,
     ) -> dict:
         headword_parts: list[str] = []
         part_of_speech: list[str] = []
         phonetics: list[str] = []
         definitions: list[str] = []
         word_origin: list[str] = []
+        definition_parts: list[str] = []
+
+        def flush_definition() -> None:
+            if not definition_parts:
+                return
+            cleaned = _clean_entry_text(" ".join(definition_parts))
+            if cleaned:
+                definitions.append(cleaned)
+            definition_parts.clear()
 
         in_word_origin = False
         for style_index, raw_text in blocks:
@@ -630,36 +682,55 @@ class ArticleDecoder:
             tag = style.tag
             if not text:
                 continue
+            if in_word_origin:
+                flush_definition()
+                cleaned = _clean_entry_text(text)
+                if "Word Origin" in text or tag in SECTION_SKIP_TAGS:
+                    continue
+                if cleaned in SECTION_HEADING_TEXT or tag.startswith("pnc_heading"):
+                    in_word_origin = False
+                    continue
+                if cleaned:
+                    word_origin.append(cleaned)
+                continue
             if tag in {"h", "h_dot", "h_sup", "hm-g"}:
+                flush_definition()
                 headword_parts.append(text)
             elif tag in {"pos", "pos-g"}:
+                flush_definition()
                 cleaned = _clean_entry_text(text)
                 if cleaned:
                     part_of_speech.append(cleaned)
             elif tag == "phon":
+                flush_definition()
                 cleaned = _clean_entry_text(text)
                 if cleaned:
                     phonetics.append(cleaned)
+            elif tag == "ptl" and phonetics:
+                flush_definition()
+                cleaned = _clean_entry_text(text)
+                if cleaned:
+                    phonetics[-1] += cleaned
             elif tag == "def":
                 cleaned = _clean_entry_text(text)
                 if cleaned:
-                    definitions.append(cleaned)
-            elif "Word Origin" in text:
-                in_word_origin = True
-            elif in_word_origin and tag in {
-                "body",
-                "ff",
-                "lang",
-                "etym_i",
-                "qt",
-                "pnc",
-                "tr_e",
-            }:
+                    definition_parts.append(cleaned)
+            elif tag in {"eb", "def_qt", "ndv"} and definition_parts:
                 cleaned = _clean_entry_text(text)
                 if cleaned:
-                    word_origin.append(cleaned)
+                    definition_parts.append(cleaned)
+            elif tag == "gram" and definition_parts and text in {"‘", "ʼ"}:
+                definition_parts.append(text)
+            elif tag in SECTION_SKIP_TAGS:
+                continue
+            elif "Word Origin" in text:
+                flush_definition()
+                in_word_origin = True
+            else:
+                flush_definition()
+        flush_definition()
 
-        return {
+        entry = {
             "index": article_index,
             "headword": _clean_entry_text("".join(headword_parts)),
             "part_of_speech": " ".join(dict.fromkeys(part_of_speech)),
@@ -667,10 +738,15 @@ class ArticleDecoder:
             "definitions": definitions,
             "word_origin": _clean_entry_text(" ".join(word_origin)),
         }
+        if include_blocks:
+            entry["visible_blocks"] = _visible_blocks(blocks, self.styles)
+        return entry
 
-    def decode_entry(self, article_index: int) -> dict:
+    def decode_entry(self, article_index: int, include_blocks: bool = False) -> dict:
         """Decode one main dictionary article into headword/definition fields."""
-        return self._entry_from_blocks(article_index, self.decode(article_index))
+        return self._entry_from_blocks(
+            article_index, self.decode(article_index), include_blocks=include_blocks
+        )
 
     def iter_articles(
         self, start: int = 0, limit: int | None = None
@@ -697,12 +773,18 @@ class ArticleDecoder:
                 break
 
     def iter_entries(
-        self, start: int = 0, limit: int | None = None, include_html: bool = False
+        self,
+        start: int = 0,
+        limit: int | None = None,
+        include_html: bool = False,
+        include_blocks: bool = False,
     ) -> "Iterator[dict]":
         """Yield main dictionary entries with definitions."""
         emitted = 0
         for article_index, blocks in self.iter_articles(start):
-            entry = self._entry_from_blocks(article_index, blocks)
+            entry = self._entry_from_blocks(
+                article_index, blocks, include_blocks=include_blocks
+            )
             if not entry["headword"] or not entry["definitions"]:
                 continue
             if include_html:
@@ -727,14 +809,18 @@ class ArticleDecoder:
                 yield article_index
 
     def find_entries(
-        self, word: str, limit: int | None = None, include_html: bool = False
+        self,
+        word: str,
+        limit: int | None = None,
+        include_html: bool = False,
+        include_blocks: bool = False,
     ) -> "Iterator[dict]":
         """Find main dictionary entries whose normalized headword matches word."""
         needle = _normalize_headword(word)
         emitted = 0
         seen: set[int] = set()
         for article_index in self._indexed_article_indices(word):
-            entry = self.decode_entry(article_index)
+            entry = self.decode_entry(article_index, include_blocks=include_blocks)
             if _normalize_headword(entry["headword"]) != needle:
                 continue
             if not entry["definitions"]:
@@ -748,7 +834,9 @@ class ArticleDecoder:
             if limit is not None and emitted >= limit:
                 return
 
-        for entry in self.iter_entries(include_html=include_html):
+        for entry in self.iter_entries(
+            include_html=include_html, include_blocks=include_blocks
+        ):
             if entry["index"] in seen:
                 continue
             if _normalize_headword(entry["headword"]) != needle:
@@ -782,6 +870,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Include rendered HTML in JSON entry output",
     )
     parser.add_argument(
+        "--with-blocks",
+        action="store_true",
+        help="Include visible article blocks in JSON entry output",
+    )
+    parser.add_argument(
         "--html", action="store_true", help="Render best-effort HTML instead of JSON"
     )
     parser.add_argument(
@@ -808,7 +901,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.word:
         include_html = args.with_html or bool(args.html_out)
         matches = list(
-            dec.find_entries(args.word, args.limit, include_html=include_html)
+            dec.find_entries(
+                args.word,
+                args.limit,
+                include_html=include_html,
+                include_blocks=args.with_blocks,
+            )
         )
         text = json.dumps(matches, ensure_ascii=False, indent=2)
         if args.html_out:
@@ -823,7 +921,11 @@ def main(argv: list[str] | None = None) -> int:
                 text = json.dumps(matches, ensure_ascii=False, indent=2)
     elif args.dump_entries:
         include_html = args.with_html or bool(args.html_out)
-        entries = dec.iter_entries(limit=args.limit, include_html=include_html)
+        entries = dec.iter_entries(
+            limit=args.limit,
+            include_html=include_html,
+            include_blocks=args.with_blocks,
+        )
         if json_out:
             html_file = (
                 args.html_out.open("w", encoding="utf-8") if args.html_out else None
@@ -868,7 +970,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("index is required unless --word or --dump-entries is used")
         if args.entry:
             result = {
-                i: dec.decode_entry(i)
+                i: dec.decode_entry(i, include_blocks=args.with_blocks)
                 for i in range(args.index, args.index + args.count)
             }
             if args.with_html:
