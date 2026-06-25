@@ -653,6 +653,7 @@ class ArticleDecoder:
                 "etym_i",
                 "qt",
                 "pnc",
+                "tr_e",
             }:
                 cleaned = _clean_entry_text(text)
                 if cleaned:
