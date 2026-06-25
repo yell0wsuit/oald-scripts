@@ -46,6 +46,9 @@ class Chunk:
         offset: Absolute byte offset of the payload within the file.
         end: Absolute byte offset of the payload's end (``offset + size``).
         extension: Detected file extension for the payload, or ``None``.
+        flag: Value of the high bit (``0x80000000``) that the size field carries
+            for some chunks. Its exact meaning is unknown; it is masked off the
+            size and preserved here for inspection.
     """
 
     ordinal: int
@@ -55,6 +58,7 @@ class Chunk:
     offset: int
     end: int
     extension: str | None = None
+    flag: bool = False
 
 
 class SdcError(Exception):
@@ -147,7 +151,11 @@ def parse_sdc(path: Path) -> tuple[dict, list[Chunk]]:
         tag_bytes = buf[entry_off : entry_off + 4]
         tag = tag_bytes.decode("ascii", "replace")
         index = u32le(buf, entry_off + 4)
-        size = u32le(buf, entry_off + 8)
+        raw_size = u32le(buf, entry_off + 8)
+        # The top bit of the size field is a per-chunk flag (meaning unknown),
+        # not part of the length; mask it off to get the real payload size.
+        flag = bool(raw_size & 0x80000000)
+        size = raw_size & 0x7FFFFFFF
         offset = u32le(buf, entry_off + 12)
         end = offset + size
         if end > len(buf):
@@ -156,7 +164,7 @@ def parse_sdc(path: Path) -> tuple[dict, list[Chunk]]:
                 f"(offset=0x{offset:x}, size=0x{size:x}, file=0x{len(buf):x})"
             )
         ext = detect_ext(buf[offset:end])
-        chunks.append(Chunk(ordinal, tag, index, size, offset, end, ext))
+        chunks.append(Chunk(ordinal, tag, index, size, offset, end, ext, flag))
 
     return header, chunks
 
