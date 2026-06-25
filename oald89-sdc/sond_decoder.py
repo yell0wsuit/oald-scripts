@@ -48,19 +48,22 @@ SPEEX_WB_RATE = 16000  # wideband native rate for codec 1
 
 
 class SondError(Exception):
-    pass
+    """Raised when a SOND blob is malformed or uses an unsupported codec."""
 
 
 def _u32(b, o):
+    """Read a little-endian uint32 from ``b`` at byte offset ``o``."""
     return struct.unpack_from("<I", b, o)[0]
 
 
 def _read(path: os.PathLike | str) -> bytes:
+    """Read and return the full contents of ``path`` as bytes."""
     with open(path, "rb") as f:
         return f.read()
 
 
 def _write(path: os.PathLike | str, data: bytes) -> None:
+    """Write ``data`` to ``path``, creating parent directories as needed."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
@@ -68,6 +71,13 @@ def _write(path: os.PathLike | str, data: bytes) -> None:
 
 
 def parse_header(blob: bytes) -> dict:
+    """Parse a decompressed SOND blob's header.
+
+    Validates the 32-byte marker, reads the codec id and payload length, and for
+    Speex (codec 1) resolves the per-frame byte size from the mode table. Returns
+    a dict of header fields plus the sliced ``payload`` bytes. Raises SondError on
+    a bad marker, an out-of-range mode index, an unknown codec, or a truncated blob.
+    """
     if len(blob) < 32:
         raise SondError(f"blob too small ({len(blob)} bytes)")
     if _u32(blob, 0) != 32:
@@ -83,7 +93,7 @@ def parse_header(blob: bytes) -> dict:
         mode_flag = _u32(blob, 36)  # ==1/100 -> table, else byte@40
         if mode_flag in (1, 100):
             idx = blob[40]
-            if not (1 <= idx <= len(MODE_FRAME_BYTES)):
+            if not 1 <= idx <= len(MODE_FRAME_BYTES):
                 raise SondError(f"mode index {idx} out of range")
             frame_bytes = MODE_FRAME_BYTES[idx - 1]
         else:
@@ -116,6 +126,10 @@ def parse_header(blob: bytes) -> dict:
 
 
 def sniff_container(p: bytes) -> str:
+    """Guess the container format from leading magic bytes.
+
+    Returns one of "wav", "caf", "m4a", "ogg", "mp3", or "raw?" if unrecognized.
+    """
     if p[:4] == b"RIFF" and p[8:12] == b"WAVE":
         return "wav"
     if p[:4] == b"caff":
@@ -130,6 +144,7 @@ def sniff_container(p: bytes) -> str:
 
 
 def write_wav(path, pcm, rate, channels=1):
+    """Write raw 16-bit PCM ``pcm`` to ``path`` as a WAV file at ``rate`` Hz."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as wf:
@@ -141,6 +156,13 @@ def write_wav(path, pcm, rate, channels=1):
 
 
 def extract(blob: bytes, out_base: os.PathLike | str) -> dict:
+    """Decode a single SOND blob and write the audio next to ``out_base``.
+
+    Passthrough codecs (2/4/5) are written as-is (or wrapped to WAV for raw PCM),
+    while Speex (codec 1) is decoded via ffmpeg. The correct extension is appended
+    to ``out_base``. Returns the header info dict augmented with the output path
+    (and, for Speex, the decoder name and duration).
+    """
     info = parse_header(blob)
     payload = info.pop("payload")
     codec = info["codec"]
@@ -173,6 +195,7 @@ def extract(blob: bytes, out_base: os.PathLike | str) -> dict:
 
 # --- inlined pure-python Ogg-Speex muxer (lets a stock ffmpeg decode raw frames) ---
 def _ogg_crc_table():
+    """Build the 256-entry lookup table for Ogg's CRC-32 (polynomial 0x04C11DB7)."""
     t = []
     for i in range(256):
         r = i << 24
@@ -190,6 +213,7 @@ _OGG_CRC = _ogg_crc_table()
 
 
 def _ogg_crc(b: bytes) -> int:
+    """Compute the Ogg page CRC-32 over ``b`` (checksum field zeroed)."""
     c = 0
     for x in b:
         c = ((c << 8) & 0xFFFFFFFF) ^ _OGG_CRC[((c >> 24) & 0xFF) ^ x]
@@ -197,6 +221,11 @@ def _ogg_crc(b: bytes) -> int:
 
 
 def _ogg_page(serial, seq, hdr_type, granule, packets):
+    """Build one Ogg page for the given stream ``serial`` and page ``seq``.
+
+    ``hdr_type`` is the header-type flag (0x02 BOS, 0x04 EOS), ``granule`` the
+    granule position, and ``packets`` the packet payloads to lace into the page.
+    """
     seg = bytearray()
     body = bytearray()
     for p in packets:
@@ -276,6 +305,11 @@ def output_base_for(input_path: Path, output_dir: Path, used: set[str]) -> Path:
 
 
 def extract_path(input_path: Path, output_dir: Path, used: set[str]) -> dict:
+    """Read the SOND blob at ``input_path`` and extract it into ``output_dir``.
+
+    ``used`` tracks already-claimed output bases to avoid collisions. Returns the
+    info dict with the source path recorded under ``input``.
+    """
     out_base = output_base_for(input_path, output_dir, used)
     info = extract(_read(input_path), out_base)
     info["input"] = str(input_path)
@@ -283,6 +317,7 @@ def extract_path(input_path: Path, output_dir: Path, used: set[str]) -> dict:
 
 
 def print_info(info: dict) -> None:
+    """Print an extraction result dict to stdout, keyed by source path."""
     print(f"\n== {info.get('input', '<memory>')} ==")
     for k, v in info.items():
         if k != "input":
@@ -290,6 +325,11 @@ def print_info(info: dict) -> None:
 
 
 def run_many(paths: list[Path], output_dir: Path, keep_going: bool) -> int:
+    """Extract every blob in ``paths``, printing a per-file result and a summary.
+
+    If ``keep_going`` is false, stops at the first failure. Returns a process exit
+    code: 0 if all succeeded, 1 if any failed.
+    """
     used: set[str] = set()
     ok = 0
     failed = 0
@@ -310,11 +350,16 @@ def run_many(paths: list[Path], output_dir: Path, keep_going: bool) -> int:
 
 
 def collect_folder(folder: Path, pattern: str, recursive: bool) -> list[Path]:
+    """Return a sorted list of files in ``folder`` matching the glob ``pattern``.
+
+    Descends into subdirectories when ``recursive`` is true.
+    """
     iterator = folder.rglob(pattern) if recursive else folder.glob(pattern)
     return sorted(p for p in iterator if p.is_file())
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser with the single/multi/folder subcommands."""
     parser = argparse.ArgumentParser(
         prog="sond.py",
         description="Extract raw SOND resource blobs to WAV/container files.",
@@ -361,6 +406,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point; dispatch the chosen subcommand and return its exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
 
