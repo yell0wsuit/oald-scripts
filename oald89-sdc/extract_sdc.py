@@ -31,11 +31,23 @@ import re
 import struct
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Sequence
 
 
 @dataclass
 class Chunk:
+    """A single entry from the SDC chunk table.
+
+    Attributes:
+        ordinal: Position of the entry in the chunk table (0-based).
+        tag: 4-byte ASCII type tag, e.g. ``IMGA``, ``STRW``, ``HEAD``.
+        index: Per-tag chunk index from the table entry.
+        size: Payload size in bytes.
+        offset: Absolute byte offset of the payload within the file.
+        end: Absolute byte offset of the payload's end (``offset + size``).
+        extension: Detected file extension for the payload, or ``None``.
+    """
+
     ordinal: int
     tag: str
     index: int
@@ -46,14 +58,20 @@ class Chunk:
 
 
 class SdcError(Exception):
-    pass
+    """Raised when a file is not a valid/parseable SLD2 SDC container."""
 
 
 def u32le(buf: bytes, off: int) -> int:
+    """Read a little-endian unsigned 32-bit integer from ``buf`` at ``off``."""
     return struct.unpack_from("<I", buf, off)[0]
 
 
 def safe_name(text: str) -> str:
+    """Sanitize ``text`` into a filesystem-safe name.
+
+    Replaces runs of disallowed characters with ``_`` and trims leading/trailing
+    dots and underscores. Falls back to ``"unnamed"`` if nothing usable remains.
+    """
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
     return text.strip("._") or "unnamed"
 
@@ -80,6 +98,20 @@ def detect_ext(data: bytes) -> str | None:
 
 
 def parse_sdc(path: Path) -> tuple[dict, list[Chunk]]:
+    """Parse the SLD2 header and chunk table of an SDC file.
+
+    Args:
+        path: Path to the ``.sdc`` file to read.
+
+    Returns:
+        A ``(header, chunks)`` tuple where ``header`` is a dict describing the
+        SLD2 header fields and ``chunks`` is the list of parsed :class:`Chunk`
+        entries.
+
+    Raises:
+        SdcError: If the file is too small, lacks the ``SLD2`` magic, or the
+            chunk table / any chunk points past the end of the file.
+    """
     buf = path.read_bytes()
     if len(buf) < 0x20:
         raise SdcError(f"{path}: too small to be an SLD2 SDC file")
@@ -153,6 +185,20 @@ def decode_utf16_string_chunk(data: bytes) -> list[str]:
 
 
 def extract_file(path: Path, out_root: Path, raw_chunks: bool = True) -> dict:
+    """Extract one SDC file's chunks to disk and return its manifest.
+
+    Writes outputs under ``out_root/<file stem>/``: ``manifest.json``, optional
+    raw ``chunks/`` binaries, decoded ``images/``, and ``text/`` files for
+    UTF-16 string chunks (``STRW``/``STRL``).
+
+    Args:
+        path: Path to the ``.sdc`` file to extract.
+        out_root: Directory under which the per-file output folder is created.
+        raw_chunks: If ``True``, also write every chunk's raw payload as ``.bin``.
+
+    Returns:
+        The manifest dict that was serialized to ``manifest.json``.
+    """
     buf = path.read_bytes()
     header, chunks = parse_sdc(path)
 
@@ -218,7 +264,15 @@ def extract_file(path: Path, out_root: Path, raw_chunks: bool = True) -> dict:
     return manifest
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point: extract one or more ``.sdc`` files.
+
+    Args:
+        argv: Optional argument list (defaults to ``sys.argv`` when ``None``).
+
+    Returns:
+        Process exit code (``0`` on success).
+    """
     parser = argparse.ArgumentParser(
         description="Extract SLD2/Sdc chunk contents from *.sdc files."
     )
